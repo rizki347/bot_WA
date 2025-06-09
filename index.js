@@ -7,9 +7,7 @@ import bodyParser from 'body-parser';
 import qrcode from 'qrcode';
 import cloudinary from 'cloudinary';
 import jwt from 'jsonwebtoken';
-import dotenv from 'dotenv';
 
-dotenv.config(); // Load .env file
 
 const app = express();
 const PORT = process.env.PORT || 3000;
