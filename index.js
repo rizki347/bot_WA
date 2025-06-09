@@ -1,3 +1,4 @@
+import puppeteer from 'puppeteer';
 import pkg from 'whatsapp-web.js';
 const { Client, LocalAuth, MessageMedia } = pkg;
 import fetch from 'node-fetch';
@@ -6,31 +7,38 @@ import bodyParser from 'body-parser';
 import qrcode from 'qrcode';
 import cloudinary from 'cloudinary';
 import jwt from 'jsonwebtoken';
+import dotenv from 'dotenv';
+
+dotenv.config(); // Load .env file
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Konfigurasi Cloudinary
+app.use(bodyParser.json());
+
+// ✅ Cloudinary config
 cloudinary.config({
-  cloud_name: 'dn4mbrhj4',
-  api_key: '623695854384555',
-  api_secret: '_eDLYHDoIqrzMJBBjHJ7mfyWUz8',
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Service Account untuk Firebase JWT
+// ✅ Firebase Service Account
 const serviceAccount = {
-  private_key: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
-  client_email: 'firebase-adminsdk-fbsvc@bot-wa-dd801.iam.gserviceaccount.com',
-  project_id: 'bot-wa-dd801',
+  type: 'service_account',
+  project_id: process.env.FIREBASE_PROJECT_ID,
+  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+  private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  client_email: process.env.FIREBASE_CLIENT_EMAIL,
+  token_uri: 'https://oauth2.googleapis.com/token',
 };
 
-// Fungsi untuk ambil access token dari Firebase
 async function getAccessToken() {
   const now = Math.floor(Date.now() / 1000);
   const payload = {
     iss: serviceAccount.client_email,
     sub: serviceAccount.client_email,
-    aud: 'https://oauth2.googleapis.com/token',
+    aud: serviceAccount.token_uri,
     iat: now,
     exp: now + 3600,
     scope: 'https://www.googleapis.com/auth/datastore',
@@ -38,7 +46,7 @@ async function getAccessToken() {
 
   const jwtToken = jwt.sign(payload, serviceAccount.private_key, { algorithm: 'RS256' });
 
-  const response = await fetch('https://oauth2.googleapis.com/token', {
+  const response = await fetch(serviceAccount.token_uri, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -48,132 +56,147 @@ async function getAccessToken() {
   });
 
   const data = await response.json();
+
+  // ✅ Validasi access token
+  if (!data.access_token) {
+    console.error('❌ Gagal ambil access token:', data);
+    throw new Error(`Gagal ambil access token: ${data.error_description || JSON.stringify(data)}`);
+  }
+
   return data.access_token;
 }
 
-// Inisialisasi WhatsApp client
-console.log('Memulai inisialisasi WhatsApp client...');
+
+// === WhatsApp Client ===
+
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
+    executablePath: puppeteer.executablePath(), // ✅ Pakai path Chrome yang di-download puppeteer
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  },
-});
-
-// QR Code login
-client.on('qr', async (qr) => {
-  console.log('📸 QR Code diterima, silakan scan...');
-  try {
-    const url = await qrcode.toDataURL(qr);
-    const result = await cloudinary.v2.uploader.upload(url, {
-      folder: 'whatsapp_qrcodes',
-      public_id: 'qrcode_image',
-      resource_type: 'image',
-    });
-    console.log('✅ QR Code diupload:', result.secure_url);
-  } catch (err) {
-    console.error('❌ Gagal membuat/mengupload QR:', err);
-    console.error('Detail QR:', qr);
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
   }
 });
 
-// Event saat bot siap
-client.on('ready', () => {
-  console.log('✅ Bot WhatsApp siap digunakan!');
-});
+// === QR Handler ===
 
-client.on('auth_failure', msg => {
-  console.error('❌ Autentikasi gagal:', msg);
-});
+function setupQR(client, label) {
+  client.on('qr', async (qr) => {
+    console.log(`[${label}] Scan QR:`);
+    const url = await qrcode.toDataURL(qr);
+    const result = await cloudinary.v2.uploader.upload(url, {
+      folder: 'whatsapp_qrcodes',
+      public_id: `qr_${label}`,
+      resource_type: 'image',
+    });
+    console.log(`[${label}] QR uploaded:`, result.secure_url);
+  });
+}
 
-client.on('disconnected', reason => {
-  console.error('❌ Bot terputus:', reason);
-});
+setupQR(client, 'client1');
 
-// Pesan masuk
-client.on('message', async (message) => {
-  if (message.fromMe) return;
+// === Status Logger ===
 
-  const userId = message.from;
-  const userMessage = message.body;
+function setupClientStatus(client, label) {
+  client.on('ready', () => console.log(`✅ [${label}] Bot siap digunakan!`));
+  client.on('auth_failure', msg => console.error(`❌ [${label}] Gagal autentikasi:`, msg));
+  client.on('disconnected', reason => console.warn(`⚠️ [${label}] Terputus:`, reason));
+  client.on('loading_screen', (percent, message) => {
+    console.log(`🌀 [${label}] Loading ${percent}% - ${message}`);
+  });
+}
 
-  console.log('📥 Pesan dari', userId, ':', userMessage);
+setupClientStatus(client, 'client1');
+
+// === Message Handler ===
+
+client.on('message', async (msg) => {
+  console.log(`[client1] Pesan dari ${msg.from} ke ${msg.to}: "${msg.body}" pada ${new Date(msg.timestamp * 1000).toLocaleString()}`);
+  if (msg.fromMe) return;
 
   try {
     const accessToken = await getAccessToken();
 
-    const webhookResponse = await fetch('https://hook.eu2.make.com/fsh51ub7tasw8koialuh7h911fgrt1i7', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: userMessage,
-        from: userId,
-        access_token: accessToken,
-      }),
-    });
+    if (msg.hasMedia) {
+      const media = await msg.downloadMedia();
+      const upload = await cloudinary.v2.uploader.upload(`data:${media.mimetype};base64,${media.data}`, {
+        folder: 'wa-inbox-images',
+        resource_type: 'image',
+      });
 
-    const contentType = webhookResponse.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      const text = await webhookResponse.text();
-      console.warn('⚠️ Webhook tidak mengembalikan JSON. Respons:', text);
-      return;
-    }
+    const res = await fetch(process.env.WEBHOOK_URL, {
+     method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: msg.from,
+          imageUrl: upload.secure_url,
+          mimetype: media.mimetype,
+          text: msg.caption || msg.body || '',
+          access_token: accessToken,
+          timestamp: new Date().toISOString(),
+        }),
+      });
 
-    const data = await webhookResponse.json();
-    if (data.reply) {
-      await message.reply(data.reply);
-      console.log('✅ Balasan berhasil dikirim.');
-    } else {
-      console.log('ℹ️ Tidak ada balasan dari webhook.');
+    console.log(`[client1] Webhook (media) status: ${res.status}`);
+  } else {
+      const res = await fetch(process.env.WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: msg.from,
+          text: msg.body,
+          access_token: accessToken,
+          timestamp: new Date().toISOString(),
+        }),
+      });
+
+      console.log(`[client1] Webhook (teks) status: ${res.status}`);
     }
-  } catch (error) {
-    console.error('❌ Gagal memproses pesan:', error);
+  } catch (err) {
+    console.error(`[client1] Gagal kirim ke webhook:`, err);
   }
 });
 
-// Endpoint test Railway
-app.get('/', (req, res) => {
-  res.send('WhatsApp bot aktif.');
+// === Endpoint Balasan ===
+
+app.post('/reply', async (req, res) => {
+  await handleReply(req, res, client, 'client1');
 });
 
-// Endpoint kirim pesan manual
-app.use(bodyParser.json());
-app.post('/reply', async (req, res) => {
+async function handleReply(req, res, client, label) {
   try {
-    let payload;
-
-    if (typeof req.body === 'string') {
-      try {
-        payload = JSON.parse(req.body);
-      } catch (e) {
-        return res.status(400).json({ error: 'Format JSON tidak valid.' });
-      }
-    } else if (typeof req.body.data === 'string') {
-      try {
-        payload = JSON.parse(req.body.data);
-      } catch (e) {
-        return res.status(400).json({ error: 'Format JSON dalam field "data" tidak valid.' });
-      }
-    } else {
-      payload = req.body.data || req.body;
-    }
+console.log(`[${label}] Payload masuk ke /reply:`, JSON.stringify(req.body, null, 2));
+    const payload = typeof req.body === 'string'
+      ? JSON.parse(req.body)
+      : typeof req.body.data === 'string'
+        ? JSON.parse(req.body.data)
+        : req.body.data || req.body;
 
     const { from, reply, imageUrl, caption } = payload;
 
     if (!from || (!reply && !imageUrl)) {
-      return res.status(400).json({
-        error: 'Parameter "from" dan minimal salah satu dari "reply" atau "imageUrl" wajib diisi',
-        contoh_format: {
-          from: '628xxxx@c.us',
-          reply: 'Pesan balasan',
-          imageUrl: 'https://domain.com/file.jpg',
-          caption: 'Ini caption opsional',
-        },
-      });
+      return res.status(400).json({ error: 'from dan reply/imageUrl wajib' });
     }
 
-    if (imageUrl) {
+    if (Array.isArray(imageUrl)) {
+      if (imageUrl.length === 1) {
+        // ✅ Jika hanya 1 gambar dalam array, kirim seperti biasa
+        const media = await MessageMedia.fromUrl(imageUrl[0], { unsafeMime: true });
+        await client.sendMessage(from, media, { caption: caption || reply || '' });
+      } else {
+        // ✅ Jika banyak gambar, kirim sebagai galeri
+        const mediaList = await Promise.all(
+  imageUrl.map(async (url) => await MessageMedia.fromUrl(url, { unsafeMime: true }))
+);
+
+console.log(`[${label}] Kirim ${mediaList.length} gambar ke ${from}`);
+
+for (let i = 0; i < mediaList.length; i++) {
+  const options = i === 0 ? { caption: caption || reply || '' } : {};
+  await client.sendMessage(from, mediaList[i], options);
+}
+      }
+    } else if (typeof imageUrl === 'string') {
       const media = await MessageMedia.fromUrl(imageUrl, { unsafeMime: true });
       await client.sendMessage(from, media, { caption: caption || reply || '' });
     } else {
@@ -182,21 +205,28 @@ app.post('/reply', async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Error di /reply:', err);
-    res.status(500).json({
-      error: 'Gagal memproses permintaan.',
-      detail: err.message,
-      raw: req.body,
-    });
+    console.error(`[${label}] Error balas:`, err.message);
+    res.status(500).json({ error: 'Gagal balas', detail: err.message });
   }
+}
+
+// === Server Start ===
+
+app.get('/', (req, res) => {
+  res.send('WhatsApp bot aktif!');
 });
 
-// Inisialisasi bot
-client.initialize()
-  .then(() => console.log('✅ client.initialize() sukses'))
-  .catch(err => console.error('❌ Gagal initialize WhatsApp client:', err));
-
-// Jalankan server
 app.listen(PORT, () => {
-  console.log(`🚀 Server Express aktif di port ${PORT}`);
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  startBot(); // Panggil fungsi async ini
 });
+
+async function startBot() {
+  try {
+    console.log('🔄 Inisialisasi client1...');
+    await client.initialize();
+    console.log('✅ Inisialisasi client1 selesai');
+  } catch (err) {
+    console.error('❌ Gagal inisialisasi client1:', err.message);
+  }
+}
